@@ -1,0 +1,283 @@
+#!/bin/zsh
+set -euo pipefail
+
+PATH=/usr/bin:/bin:/usr/sbin:/sbin
+VERSION=0.1.0
+
+apply=false
+eject_after=false
+include_trashes=false
+force_mac=false
+volume_arg=
+disk_plist=
+mount_point=
+device_identifier=
+volume_device=
+
+usage() {
+  cat <<'EOF'
+poopsbgone - remove macOS metadata from external volumes
+
+Usage:
+  poopsbgone [options] /Volumes/NAME
+
+Options:
+  --apply             Perform cleanup. Without this, show an exact preview.
+  --eject             Eject after a successful apply-mode cleanup.
+  --include-trashes   Also remove the root-level .Trashes directory.
+  --force-mac         Allow APFS/HFS volumes; keep all other safety checks.
+  --version           Print the version and exit.
+  -h, --help          Show this help and exit.
+
+Default cleanup:
+  .DS_Store           Removed recursively, without crossing filesystems.
+  ._*                 AppleDouble sidecar files removed recursively.
+  .Spotlight-V100     Removed at the volume root.
+  .fseventsd          Removed at the volume root.
+  .metadata_never_index
+  .TemporaryItems
+  .DocumentRevisions-V100
+
+Safety:
+  Dry-run by default. Requires the exact mount root of an external, writable
+  volume below /Volumes. Refuses APFS/HFS unless --force-mac is supplied.
+EOF
+}
+
+die() {
+  print -ru2 -- "poopsbgone: $*"
+  exit 2
+}
+
+say() {
+  print -r -- "$*"
+}
+
+quoted() {
+  print -rn -- "${(qqqq)1}"
+}
+
+plist_value() {
+  local key=$1
+  printf '%s' "$disk_plist" | plutil -extract "$key" raw -o - - 2>/dev/null || true
+}
+
+is_apple_filesystem() {
+  case "${(L)1}" in
+    apfs|hfs|hfs+|hfsplus|jhfs+|jhfsx|hfsx) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+inspect_volume() {
+  disk_plist=$(diskutil info -plist "$volume" 2>/dev/null) ||
+    die "diskutil could not inspect volume: $(quoted "$volume")"
+}
+
+validate_volume_identity() {
+  local current_mount current_device current_internal current_writable current_dev
+
+  inspect_volume
+  current_mount=$(plist_value MountPoint)
+  current_device=$(plist_value DeviceIdentifier)
+  current_internal=$(plist_value Internal)
+  current_writable=$(plist_value Writable)
+  [[ -n "$current_writable" ]] || current_writable=$(plist_value WritableVolume)
+
+  [[ -n "$current_mount" && -n "$current_device" ]] ||
+    die "could not confirm mount identity"
+  [[ "${current_mount:A}" == "$mount_point" ]] ||
+    die "mount point changed during cleanup"
+  [[ "$current_device" == "$device_identifier" ]] ||
+    die "device changed during cleanup"
+  [[ "$current_internal" == false ]] || die "volume is no longer external"
+  [[ "$current_writable" == true ]] || die "volume is no longer writable"
+
+  current_dev=$(stat -f '%d' "$volume" 2>/dev/null) ||
+    die "could not confirm volume filesystem"
+  [[ "$current_dev" == "$volume_device" ]] ||
+    die "volume filesystem changed during cleanup"
+}
+
+list_or_remove_metadata() {
+  local item action
+
+  validate_volume_identity
+  if $apply; then
+    action="Removed"
+    if ! find -x "$volume" -type f \( -name '.DS_Store' -o -name '._*' \) \
+      -delete -print0 2>/dev/null |
+        while IFS= read -r -d '' item; do
+          say "$action: $(quoted "$item")"
+        done; then
+      die "metadata cleanup failed"
+    fi
+  else
+    action="Would remove"
+    if ! find -x "$volume" -type f \( -name '.DS_Store' -o -name '._*' \) \
+      -print0 2>/dev/null |
+        while IFS= read -r -d '' item; do
+          say "$action: $(quoted "$item")"
+        done; then
+      die "metadata preview failed"
+    fi
+  fi
+}
+
+remove_root_target() {
+  local target_path=$1 expected_id current_id
+
+  [[ -e "$target_path" || -L "$target_path" ]] || return 0
+
+  if ! $apply; then
+    say "Would remove: $(quoted "$target_path")"
+    return 0
+  fi
+
+  validate_volume_identity
+
+  if [[ -L "$target_path" || -f "$target_path" ]]; then
+    rm -f -- "$target_path" 2>/dev/null || die "root target removal failed"
+    say "Removed: $(quoted "$target_path")"
+    return 0
+  fi
+
+  [[ -d "$target_path" && ! -L "$target_path" ]] ||
+    die "refusing unsupported cleanup target: $(quoted "$target_path")"
+
+  expected_id=$(stat -f '%d:%i' "$target_path" 2>/dev/null) ||
+    die "could not identify cleanup target: $(quoted "$target_path")"
+  [[ "${expected_id%%:*}" == "$volume_device" ]] ||
+    die "refusing target on another filesystem: $(quoted "$target_path")"
+
+  # A subshell's current directory is an opened reference to the validated
+  # directory. Traversal through `.` cannot be retargeted by renaming or
+  # replacing the original pathname after the checks below.
+  (
+    local opened_id
+    cd "$target_path" 2>/dev/null || die "could not enter cleanup target"
+    opened_id=$(stat -f '%d:%i' . 2>/dev/null) ||
+      die "could not identify opened cleanup target"
+    [[ "$opened_id" == "$expected_id" && ! -L "$target_path" ]] ||
+      die "cleanup target changed before traversal"
+    current_id=$(stat -f '%d:%i' "$target_path" 2>/dev/null) ||
+      die "cleanup target disappeared before traversal"
+    [[ "$current_id" == "$expected_id" ]] ||
+      die "cleanup target changed before traversal"
+    find -x . -mindepth 1 -depth -delete 2>/dev/null ||
+      die "root target cleanup failed"
+  )
+
+  [[ -d "$target_path" && ! -L "$target_path" ]] ||
+    die "cleanup target changed during traversal"
+  current_id=$(stat -f '%d:%i' "$target_path" 2>/dev/null) ||
+    die "cleanup target disappeared during traversal"
+  [[ "$current_id" == "$expected_id" ]] ||
+    die "cleanup target changed during traversal"
+
+  rmdir "$target_path" 2>/dev/null || die "root target removal failed"
+  say "Removed: $(quoted "$target_path")"
+}
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --apply) apply=true ;;
+    --eject) eject_after=true ;;
+    --include-trashes) include_trashes=true ;;
+    --force-mac) force_mac=true ;;
+    --version)
+      say "$VERSION"
+      exit 0
+      ;;
+    -h|--help)
+      usage
+      exit 0
+      ;;
+    --)
+      shift
+      break
+      ;;
+    -*) die "unknown option: $(quoted "$1")" ;;
+    *)
+      [[ -z "$volume_arg" ]] || die "only one volume path may be provided"
+      volume_arg=$1
+      ;;
+  esac
+  shift
+done
+
+if [[ $# -gt 0 ]]; then
+  [[ -z "$volume_arg" ]] || die "only one volume path may be provided"
+  volume_arg=$1
+  shift
+fi
+
+[[ $# -eq 0 ]] || die "unexpected trailing arguments"
+[[ -n "$volume_arg" ]] || die "missing volume path; try --help"
+
+volume=${volume_arg%/}
+[[ -d "$volume" ]] || die "not a mounted directory: $(quoted "$volume")"
+volume=${volume:A}
+[[ "$volume" == /Volumes/* ]] || die "refusing non-/Volumes path: $(quoted "$volume")"
+[[ "$volume" != /Volumes ]] || die "refusing /Volumes itself"
+
+inspect_volume
+internal=$(plist_value Internal)
+writable=$(plist_value Writable)
+filesystem_type=$(plist_value FilesystemType)
+volume_name=$(plist_value VolumeName)
+mount_point=$(plist_value MountPoint)
+device_identifier=$(plist_value DeviceIdentifier)
+
+[[ -n "$writable" ]] || writable=$(plist_value WritableVolume)
+[[ -n "$filesystem_type" ]] || die "could not determine filesystem type"
+[[ -n "$mount_point" && -n "$device_identifier" ]] ||
+  die "could not determine mount identity"
+[[ -n "$volume_name" ]] || volume_name=${volume:t}
+mount_point=${mount_point:A}
+
+[[ "$mount_point" == "$volume" ]] ||
+  die "target must be the volume mount root: $(quoted "$mount_point")"
+[[ "$internal" == false ]] || die "refusing internal disk: $(quoted "$volume")"
+[[ "$writable" == true ]] || die "refusing read-only volume: $(quoted "$volume")"
+
+if is_apple_filesystem "$filesystem_type" && ! $force_mac; then
+  die "refusing Mac filesystem '$(quoted "$filesystem_type")' without --force-mac"
+fi
+
+volume_device=$(stat -f '%d' "$volume" 2>/dev/null) ||
+  die "could not determine volume filesystem"
+
+say "Volume: $(quoted "$volume_name")"
+say "Path: $(quoted "$volume")"
+say "Filesystem: $(quoted "$filesystem_type")"
+say "Mode: $($apply && print apply || print dry-run)"
+say ""
+
+list_or_remove_metadata
+
+root_targets=(
+  .Spotlight-V100
+  .fseventsd
+  .metadata_never_index
+  .TemporaryItems
+  .DocumentRevisions-V100
+)
+$include_trashes && root_targets+=(.Trashes)
+
+for target in "${root_targets[@]}"; do
+  remove_root_target "$volume/$target"
+done
+
+if $eject_after; then
+  if ! $apply; then
+    say ""
+    say "Dry run only. Re-run with --apply to clean and eject."
+  else
+    validate_volume_identity
+    diskutil eject "$device_identifier" >/dev/null 2>&1 || die "volume eject failed"
+  fi
+elif ! $apply; then
+  say ""
+  say "Dry run only. Re-run with --apply to clean."
+fi

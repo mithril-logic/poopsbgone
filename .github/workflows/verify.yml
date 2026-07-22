@@ -1,0 +1,22 @@
+name: macOS verification
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: macos-14
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Verify syntax and CLI safety boundary
+        shell: /bin/zsh {0}
+        run: test/smoke.zsh
+      - name: Verify cleanup on a disposable disk image
+        shell: /bin/zsh {0}
+        run: test/integration.zsh
